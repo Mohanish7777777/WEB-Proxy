@@ -1,4 +1,7 @@
-use std::error::Error;
+use std::{
+	error::Error,
+	mem::{replace, take},
+};
 
 use oxc::{
 	allocator::{Allocator, StringBuilder},
@@ -40,6 +43,8 @@ where
 	pub config: &'data Config,
 	pub rewriter: &'data E,
 	pub flags: Flags,
+	// pub(crate) is_if_stmt: bool,
+	// pub(crate) arrow: bool,
 }
 
 impl<'data, E> Visitor<'_, 'data, E>
@@ -78,11 +83,13 @@ where
 			| Expression::BooleanLiteral(_) => {}
 			Expression::StringLiteral(lit) => {
 				if UNSAFE_GLOBALS.contains(&lit.value.as_str()) {
+					self.jschanges.add(rewrite!(it.object.span(), WrapObject,));
 					self.jschanges
 						.add(rewrite!(it.expression.span(), WrapProperty,));
 				}
 			}
 			_ => {
+				self.jschanges.add(rewrite!(it.object.span(), WrapObject,));
 				self.jschanges
 					.add(rewrite!(it.expression.span(), WrapProperty,));
 			}
@@ -117,7 +124,7 @@ where
 					// correct thing to do here is to change it into an AsignmentTargetPropertyProperty
 					// { $sj_location: location } = self;
 					if UNSAFE_GLOBALS.contains(&p.binding.name.to_string().as_str()) {
-    					let mut tempvar = false;
+						let mut tempvar = false;
 						if p.binding.name == "location" {
 							tempvar = true;
 							*location_assigned = true;
@@ -150,7 +157,10 @@ where
 							if UNSAFE_GLOBALS.contains(&id.name.to_string().as_str()) {
 								self.jschanges.add(rewrite!(
 									p.name.span(),
-									RewriteProperty { ident: id.name }
+									RewriteProperty {
+										ident: id.name,
+										wrap: false
+									}
 								));
 							}
 						}
@@ -169,17 +179,17 @@ where
 					let mut target;
 
 					if let Some(t) = p.binding.as_assignment_target() {
-					    target = t;
+						target = t;
 					} else {
-    					match &p.binding {
-    						AssignmentTargetMaybeDefault::AssignmentTargetWithDefault(d) => {
-                                target = &d.binding;
-                                // { location: x = parent } = {};
-    							// we still need to rewrite whatever stuff might be in the default expression
-    							walk::walk_expression(self, &d.init);
-                            }
-                            _=>unreachable!()
-                        }
+						match &p.binding {
+							AssignmentTargetMaybeDefault::AssignmentTargetWithDefault(d) => {
+								target = &d.binding;
+								// { location: x = parent } = {};
+								// we still need to rewrite whatever stuff might be in the default expression
+								walk::walk_expression(self, &d.init);
+							}
+							_ => unreachable!(),
+						}
 					}
 
 					match &target {
@@ -286,14 +296,18 @@ where
 												ident: self
 													.alloc
 													.alloc_str(&self.config.templocid)
-													.into()
+													.into(),
+												wrap: false,
 											}
 										));
 										*location_assigned = true;
 									} else {
 										self.jschanges.add(rewrite!(
 											id.span(),
-											RewriteProperty { ident: id.name }
+											RewriteProperty {
+												ident: id.name,
+												wrap: false
+											}
 										));
 									}
 								}
@@ -346,8 +360,13 @@ where
 		}
 	}
 
-	fn handle_for_of_in(&mut self, left: &ForStatementLeft<'data>, right: &Expression<'data>, body: &Statement<'data>) {
-    	let mut restids: Vec<Atom<'data>> = Vec::new();
+	fn handle_for_of_in(
+		&mut self,
+		left: &ForStatementLeft<'data>,
+		right: &Expression<'data>,
+		body: &Statement<'data>,
+	) {
+		let mut restids: Vec<Atom<'data>> = Vec::new();
 		let mut location_assigned: bool = false;
 		if let ForStatementLeft::VariableDeclaration(v) = &left {
 			self.handle_var_declarator(&v, &mut restids, &mut location_assigned);
@@ -425,10 +444,12 @@ where
 				}
 
 				if UNSAFE_GLOBALS.contains(&s.property.name.as_str()) {
+					self.jschanges.add(rewrite!(s.object.span(), WrapObject,));
 					self.jschanges.add(rewrite!(
 						s.property.span(),
 						RewriteProperty {
-							ident: s.property.name
+							ident: s.property.name,
+							wrap: true,
 						}
 					));
 				}
@@ -582,31 +603,45 @@ where
 			);
 		}
 
-		if restids.len() > 0 || location_assigned {
-			if let Some(b) = &it.body {
-				walk::walk_function_body(self, b);
-				if let Some(stmt) = b.statements.get(0) {
-					let span = stmt.span();
-					self.jschanges.add(rewrite!(
-						Span::new(span.start, span.start),
-						CleanFunction {
-							restids,
-							expression: false,
-							location_assigned,
-							wrap: false,
-						}
-					));
-				}
+		// if restids.len() > 0 || location_assigned {
+		if let Some(b) = &it.body {
+			walk::walk_function_body(self, b);
+			if let Some(stmt) = b.statements.get(0) {
+				let span = stmt.span();
+				self.jschanges.add(rewrite!(
+					Span::new(span.start, span.start),
+					CleanFunction {
+						restids,
+						expression: false,
+						location_assigned,
+						wrap: false,
+					}
+				));
 			}
 		}
+		// }
 	}
 
 	fn visit_arrow_function_expression(
 		&mut self,
 		it: &oxc::ast::ast::ArrowFunctionExpression<'data>,
 	) {
+		// self.arrow = true;
 		if !self.flags.destructure_rewrites {
-			walk::walk_arrow_function_expression(self, it);
+			if self.flags.do_sourcemaps {
+				self.jschanges
+					.add(rewrite!(Span::new(it.span.start, it.span.start), SourceTag));
+			}
+
+			if it.expression {
+				if let Some(stmt) = &it.body.statements.get(0) {
+					if let Statement::ExpressionStatement(expr) = stmt {
+						self.visit_expression_statement(&expr);
+					}
+				}
+			} else {
+				walk::walk_function_body(self, &it.body);
+			}
 			return;
 		}
 
@@ -620,8 +655,15 @@ where
 				&mut location_assigned,
 			);
 		}
-
-		walk::walk_function_body(self, &it.body);
+		if it.expression {
+			if let Some(stmt) = &it.body.statements.get(0) {
+				if let Statement::ExpressionStatement(expr) = stmt {
+					self.visit_expression_statement(&expr);
+				}
+			}
+		} else {
+			walk::walk_function_body(self, &it.body);
+		}
 		if let Some(stmt) = &it.body.statements.get(0) {
 			self.jschanges.add(rewrite!(
 				stmt.span(),
@@ -672,10 +714,10 @@ where
 	}
 
 	fn visit_for_of_statement(&mut self, it: &oxc::ast::ast::ForOfStatement<'data>) {
-    	self.handle_for_of_in(&it.left, &it.right, &it.body);
+		self.handle_for_of_in(&it.left, &it.right, &it.body);
 	}
 	fn visit_for_in_statement(&mut self, it: &oxc::ast::ast::ForInStatement<'data>) {
-    	self.handle_for_of_in(&it.left, &it.right, &it.body);
+		self.handle_for_of_in(&it.left, &it.right, &it.body);
 	}
 
 	fn visit_function_body(&mut self, it: &FunctionBody<'data>) {
@@ -684,6 +726,14 @@ where
 			self.jschanges
 				.add(rewrite!(Span::new(it.span.start, it.span.start), SourceTag));
 		}
+		// if !take(&mut self.arrow) {
+		// if let Some(stmt) = it.statements.get(0) {
+		// 	self.jschanges.add(rewrite!(
+		// 		Span::new(stmt.span().start, stmt.span().start),
+		// 		DeclTempLoc
+		// 	));
+		// }
+		// }
 
 		walk::walk_function_body(self, it);
 	}
@@ -736,7 +786,6 @@ where
 			walk::walk_variable_declaration(self, it);
 			return;
 		}
-
 		let mut restids: Vec<Atom<'data>> = Vec::new();
 		let mut location_assigned: bool = false;
 		self.handle_var_declarator(&it, &mut restids, &mut location_assigned);
@@ -755,6 +804,7 @@ where
 	}
 
 	fn visit_assignment_expression(&mut self, it: &AssignmentExpression<'data>) {
+		// self.jschanges.add(rewrite!(it.span, Wrap));
 		match &it.left {
 			AssignmentTarget::AssignmentTargetIdentifier(s) => {
 				// location = ...
@@ -773,10 +823,12 @@ where
 			AssignmentTarget::StaticMemberExpression(s) => {
 				// window.location = ...
 				if UNSAFE_GLOBALS.contains(&s.property.name.as_str()) {
+					self.jschanges.add(rewrite!(s.object.span(), WrapObject,));
 					self.jschanges.add(rewrite!(
 						s.property.span(),
 						RewriteProperty {
-							ident: s.property.name
+							ident: s.property.name,
+							wrap: true,
 						}
 					));
 				}
@@ -833,5 +885,27 @@ where
 			_ => {}
 		}
 		walk::walk_expression(self, &it.right);
+	}
+
+	fn visit_statement(&mut self, it: &Statement<'data>) {
+		// let old = take(&mut self.is_if_stmt);
+		// if !old {
+		if let Statement::ExpressionStatement(_) = it {
+			self.jschanges.add(rewrite!(it.span(), BeginStatement));
+		}
+		// }
+		walk::walk_statement(self, it);
+		// self.is_if_stmt = old;
+		// if old {
+		// 	return;
+		// }
+		if let Statement::ExpressionStatement(_) = it {
+			self.jschanges.add(rewrite!(it.span(), EndStatement));
+		}
+	}
+	fn visit_if_statement(&mut self, it: &oxc::ast::ast::IfStatement<'data>) {
+		// let old = replace(&mut self.is_if_stmt, true);
+		walk::walk_if_statement(self, it);
+		// self.is_if_stmt = old;
 	}
 }

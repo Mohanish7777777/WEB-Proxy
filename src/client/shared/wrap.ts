@@ -51,14 +51,15 @@ export default function (client: ScramjetClient, self: typeof globalThis) {
 		enumerable: false,
 	});
 	Object.defineProperty(self, config.globals.wrappropertyfn, {
-		value: function (str) {
+		value: function (object, str) {
 			if (
 				str === "location" ||
 				str === "parent" ||
 				str === "top" ||
 				str === "eval"
 			)
-				return config.globals.wrappropertybase + str;
+				if (object === self || object === self.document)
+					return config.globals.wrappropertybase + str;
 
 			return str;
 		},
@@ -68,6 +69,23 @@ export default function (client: ScramjetClient, self: typeof globalThis) {
 	});
 	Object.defineProperty(self, config.globals.cleanrestfn, {
 		value: function (obj) {
+			for (const unsafeKey in {
+				location: true,
+				parent: true,
+				top: true,
+				eval: true,
+			})
+				if (unsafeKey in obj) {
+					if (obj[unsafeKey] === self[unsafeKey]) {
+						obj[unsafeKey] = self[config.globals.wrappropertybase + unsafeKey];
+						continue;
+					}
+					if (obj[unsafeKey] === self.document[unsafeKey]) {
+						obj[unsafeKey] =
+							self.document[config.globals.wrappropertybase + unsafeKey];
+						continue;
+					}
+				}
 			// TODO
 		},
 		writable: false,
@@ -171,6 +189,11 @@ export default function (client: ScramjetClient, self: typeof globalThis) {
 			}
 		},
 		writable: false,
+		configurable: false,
+	});
+	Object.defineProperty(self, config.globals.templocid, {
+		value: undefined,
+		writable: true,
 		configurable: false,
 	});
 }
